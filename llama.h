@@ -297,6 +297,7 @@ extern "C" {
     LLAMA_API int llama_n_vocab    (const struct llama_model * model);
     LLAMA_API int llama_n_ctx_train(const struct llama_model * model);
     LLAMA_API int llama_n_embd     (const struct llama_model * model);
+    LLAMA_API int llama_n_head     (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_rope_freq_scale_train(const struct llama_model * model);
@@ -625,6 +626,9 @@ extern "C" {
                            llama_token   token,
                                   char * buf,
                                   int    length);
+
+    // Sets rope_freq_base of llama context
+    LLAMA_API void llama_set_rope_freq_base(struct llama_context * ctx, float freq);
 
     //
     // Grammar

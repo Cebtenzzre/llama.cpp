@@ -8718,6 +8718,10 @@ int llama_n_embd(const struct llama_model * model) {
     return model->hparams.n_embd;
 }
 
+int llama_n_head(const struct llama_model * model) {
+    return model->hparams.n_head;
+}
+
 float llama_rope_freq_scale_train(const struct llama_model * model) {
     return model->hparams.rope_freq_scale_train;
 }
@@ -9619,6 +9623,10 @@ int llama_token_to_piece(const struct llama_model * model, llama_token token, ch
         }
     }
     return 0;
+}
+
+void llama_set_rope_freq_base(struct llama_context * ctx, float freq) {
+    ctx->cparams.rope_freq_base = freq;
 }
 
 struct llama_timings llama_get_timings(struct llama_context * ctx) {
