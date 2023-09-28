@@ -40,6 +40,7 @@ layout (push_constant) uniform parameter {
     int gqa;
 } pcs;
 
+// NB: assumes BLOCKS_IN_QUANT is evenly divisible by 4 and gl_NumSubgroups is evenly divisible by 2
 void main() {
     const uint nb = uint(pcs.ne00/BLOCKS_IN_QUANT);
     const uint r0 = gl_WorkGroupID.x;
@@ -54,7 +55,7 @@ void main() {
     float sumf[N_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     const uint ix = gl_SubgroupInvocationID/2;
-    const uint il = 8*(gl_SubgroupInvocationID%2);
+    const uint il = (BLOCKS_IN_QUANT/4)*(gl_SubgroupInvocationID%2);
 
     uint yb = y + ix * BLOCKS_IN_QUANT + il;
 
@@ -62,19 +63,19 @@ void main() {
 //        gl_NumSubgroups, gl_SubgroupID, gl_SubgroupInvocationID, gl_SubgroupSize,
 //        gl_WorkGroupID.x, gl_WorkGroupID.y);
 
-    for (uint ib = ix; ib < nb; ib += gl_SubgroupSize/2) { // FIXME: we need to figure out if group size is not 32??
+    for (uint ib = ix; ib < nb; ib += gl_SubgroupSize/2) {
         for (int row = 0; row < N_ROWS; row++) {
             vec2 acc = vec2(0.0, 0.0);
             const uint index = (x + ib + row * nb) * SIZE_OF_BLOCK + pcs.inAOff;
             float d = float(u8BufToFloat16(inA, index));
             float sumy = 0.0f;
-            for (int i = 0; i < 8; i+=2) {
+            for (int i = 0; i < BLOCKS_IN_QUANT/4; i+=2) {
                 const uint16_t b = u8BufToU16(inA, index + 2 + il + i);
 
                 const float yl0 = inB[yb + i];
                 const float yl1 = inB[yb + i + 1];
-                const float yl8 = inB[yb + i + 16];
-                const float yl9 = inB[yb + i + 17];
+                const float yl8 = inB[yb + i + BLOCKS_IN_QUANT/2];
+                const float yl9 = inB[yb + i + BLOCKS_IN_QUANT/2 + 1];
 
                 sumy += yl0 + yl1 + yl8 + yl9;
 
@@ -84,7 +85,7 @@ void main() {
             sumf[row] += d * (sumy * -8.f + acc[0] + acc[1]);
         }
 
-        yb += BLOCKS_IN_QUANT * 16;
+        yb += BLOCKS_IN_QUANT * gl_SubgroupSize/2;
     }
 
     for (int row = 0; row < N_ROWS; ++row) {
