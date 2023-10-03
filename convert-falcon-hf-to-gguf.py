@@ -121,8 +121,8 @@ gguf_writer.add_embedding_length(hparams["hidden_size"])
 gguf_writer.add_feed_forward_length(4 * hparams["hidden_size"])
 gguf_writer.add_block_count(block_count)
 gguf_writer.add_head_count(hparams["num_attention_heads"])
-if "n_head_kv" in hparams:
-    gguf_writer.add_head_count_kv(hparams["n_head_kv"])
+if "num_kv_heads" in hparams:
+    gguf_writer.add_head_count_kv(hparams["num_kv_heads"])
 else:
     gguf_writer.add_head_count_kv(1)
 gguf_writer.add_layer_norm_eps(hparams["layer_norm_epsilon"])
