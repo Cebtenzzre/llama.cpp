@@ -221,10 +221,7 @@ class GGMLToGGUF:
 
     def save(self):
         print('* Preparing to save GGUF file')
-        gguf_writer = gguf.GGUFWriter(
-            self.cfg.output,
-            gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.LLAMA],
-            use_temp_file = False)
+        gguf_writer = gguf.GGUFWriter(self.cfg.output, gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.LLAMA])
         self.add_params(gguf_writer)
         self.add_vocab(gguf_writer)
         if self.special_vocab is not None:

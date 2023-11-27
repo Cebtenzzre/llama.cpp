@@ -32,7 +32,6 @@ class WriterState(Enum):
 
 class GGUFWriter:
     fout: BufferedWriter
-    temp_file: tempfile.SpooledTemporaryFile[bytes] | None
     tensors: list[np.ndarray[Any, Any]]
     _simple_value_packing = {
         GGUFValueType.UINT8:   "B",
@@ -48,10 +47,7 @@ class GGUFWriter:
         GGUFValueType.BOOL:    "?",
     }
 
-    def __init__(
-        self, path: os.PathLike[str] | str, arch: str, use_temp_file: bool = True,
-        endianess: GGUFEndian = GGUFEndian.LITTLE,
-    ):
+    def __init__(self, path: os.PathLike[str] | str, arch: str, endianess: GGUFEndian = GGUFEndian.LITTLE):
         self.fout = open(path, "wb")
         self.arch = arch
         self.endianess = endianess
@@ -61,8 +57,6 @@ class GGUFWriter:
         self.kv_data_count = 0
         self.ti_data = bytearray()
         self.ti_data_count = 0
-        self.use_temp_file = use_temp_file
-        self.temp_file = None
         self.tensors = []
         print("gguf: This GGUF file is for {0} Endian only".format(
             "Big" if self.endianess == GGUFEndian.BIG else "Little",
@@ -220,20 +214,11 @@ class GGUFWriter:
     ) -> None:
         if self.endianess == GGUFEndian.BIG:
             tensor.byteswap(inplace=True)
-        if self.use_temp_file and self.temp_file is None:
-            fp = tempfile.SpooledTemporaryFile(mode="w+b", max_size=256 * 1024 * 1024)
-            fp.seek(0)
-            self.temp_file = fp
 
         shape: Sequence[int] = raw_shape if raw_shape is not None else tensor.shape
         self.add_tensor_info(name, shape, tensor.dtype, tensor.nbytes, raw_dtype = raw_dtype)
 
-        if self.temp_file is None:
-            self.tensors.append(tensor)
-            return
-
-        tensor.tofile(self.temp_file)
-        self.write_padding(self.temp_file, tensor.nbytes)
+        self.tensors.append(tensor)
 
     def write_padding(self, fp: IO[bytes], n: int, align: int | None = None) -> None:
         pad = GGUFWriter.ggml_pad(n, align if align is not None else self.data_alignment) - n
@@ -255,21 +240,13 @@ class GGUFWriter:
 
         self.write_padding(self.fout, self.fout.tell())
 
-        if self.temp_file is None:
-            while True:
-                try:
-                    tensor = self.tensors.pop(0)
-                except IndexError:
-                    break
-                tensor.tofile(self.fout)
-                self.write_padding(self.fout, tensor.nbytes)
-            return
-
-        self.temp_file.seek(0)
-
-        shutil.copyfileobj(self.temp_file, self.fout)
-        self.flush()
-        self.temp_file.close()
+        while True:
+            try:
+                tensor = self.tensors.pop(0)
+            except IndexError:
+                break
+            tensor.tofile(self.fout)
+            self.write_padding(self.fout, tensor.nbytes)
 
     def flush(self) -> None:
         self.fout.flush()

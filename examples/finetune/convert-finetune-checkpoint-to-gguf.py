@@ -473,7 +473,7 @@ def main():
     # we should have read all available data
     assert(offset == len(data))
 
-    gguf_writer = gguf.GGUFWriter(cfg.output, gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.LLAMA], use_temp_file = False)
+    gguf_writer = gguf.GGUFWriter(cfg.output, gguf.MODEL_ARCH_NAMES[gguf.MODEL_ARCH.LLAMA])
     chk.save_gguf(gguf_writer)
     print("    gguf: write header")
     gguf_writer.write_header_to_file()
