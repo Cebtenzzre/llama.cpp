@@ -14,6 +14,9 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+#define CONT_VOCAB_MAX_SIZE_DIFFERENCE  100
+#define CONT_VOCAB_CHECK_START_TOKEN_ID 5
+
 struct results_perplexity {
     std::vector<llama_token> tokens;
     double                   ppl_value;
@@ -94,19 +97,22 @@ static void process_logits(
     }
 }
 
-static results_perplexity perplexity(llama_context * ctx, const gpt_params & params) {
+static results_perplexity perplexity(llama_context * ctx_exp, llama_context * ctx_ama, const gpt_params & params) {
     // Download: https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip?ref=salesforce-research
     // Run `./perplexity -m models/7B/ggml-model-q4_0.bin -f wiki.test.raw`
     // Output: `perplexity: 13.5106 [114/114]`
     // BOS tokens will be added for each chunk before eval
 
-    const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
-    const int n_ctx = llama_n_ctx(ctx);
+    auto * model_exp = llama_get_model(ctx_exp);
+    auto * model_ama = llama_get_model(ctx_ama);
+
+    const bool add_bos = llama_should_add_bos_token(model_exp);
+    const int  n_ctx   = llama_n_ctx(ctx_exp);
 
     auto tim1 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = ::llama_tokenize(ctx, params.prompt, add_bos);
+    std::vector<llama_token> tokens = ::llama_tokenize(ctx_exp, params.prompt, add_bos);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     fprintf(stderr, "%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -127,7 +133,9 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
     const int n_chunk_max = tokens.size() / n_ctx;
 
     const int n_chunk = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
-    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
+    const int n_vocab_exp = llama_n_vocab(model_exp);
+    const int n_vocab_ama = llama_n_vocab(model_ama);
+    const int n_vocab = std::min(n_vocab_exp, n_vocab_ama);
     const int n_batch = params.n_batch;
 
     int count = 0;
@@ -149,7 +157,8 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
         const auto t_start = std::chrono::high_resolution_clock::now();
 
         // clear the KV cache
-        llama_kv_cache_clear(ctx);
+        llama_kv_cache_clear(ctx_exp);
+        llama_kv_cache_clear(ctx_ama);
 
         for (int j = 0; j < num_batches; ++j) {
             const int batch_start = start + j * n_batch;
@@ -160,19 +169,51 @@ static results_perplexity perplexity(llama_context * ctx, const gpt_params & par
 
             // add BOS token for the first batch of each chunk
             if (add_bos && j == 0) {
-                tokens[batch_start] = llama_token_bos(llama_get_model(ctx));
+                tokens[batch_start] = llama_token_bos(model_exp);
             }
 
-            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + batch_start, batch_size, j * n_batch, 0))) {
-                fprintf(stderr, "%s : failed to eval\n", __func__);
+            if (llama_decode(ctx_exp, llama_batch_get_one(tokens.data() + batch_start, batch_size, j * n_batch, 0))) {
+                fprintf(stderr, "%s : failed to eval expert\n", __func__);
+                return {tokens, -1, logit_history, prob_history};
+            }
+            if (llama_decode(ctx_ama, llama_batch_get_one(tokens.data() + batch_start, batch_size, j * n_batch, 0))) {
+                fprintf(stderr, "%s : failed to eval amateur\n", __func__);
                 return {tokens, -1, logit_history, prob_history};
             }
 
             // restore the original token in case it was set to BOS
             tokens[batch_start] = token_org;
 
-            const auto * batch_logits = llama_get_logits(ctx);
-            logits.insert(logits.end(), batch_logits, batch_logits + batch_size * n_vocab);
+            auto * batch_logits_exp = llama_get_logits(ctx_exp);
+            auto * batch_logits_ama = llama_get_logits(ctx_ama);
+
+            const float cd_alpha = 0.1; // TODO: make CLI argument
+            const float cd_beta = 0.5; // set to 0.5 to behave like original paper
+            const float mask = std::numeric_limits<float>::lowest();
+
+#if 1
+            for (int t = 0; t < batch_size; ++t) {
+                auto * logits_exp = batch_logits_exp + t * n_vocab_exp;
+                auto * logits_ama = batch_logits_ama + t * n_vocab_ama;
+                float max_logit_exp = *std::max_element(logits_exp, logits_exp + n_vocab);
+
+                for (int i = 0; i < n_vocab_exp; ++i) {
+                    // NB: original paper applies alpha to probabilities, further paper defines in terms of log probs
+                    //     both have the same meaning
+                    if (logits_exp[i] < max_logit_exp + log(cd_alpha)) {
+                        // not a plausible token according to expert
+                        logits_exp[i] = (1 + cd_beta) * logits_exp[i] - cd_beta * std::max(0.0f, logits_ama[i]);
+                    } else if (i >= n_vocab) {
+                        // token not known to amateur
+                        logits_exp[i] = mask;
+                    } else {
+                        logits_exp[i] = (1 + cd_beta) * logits_exp[i] - cd_beta * logits_ama[i];
+                    }
+                }
+            }
+#endif
+
+            logits.insert(logits.end(), batch_logits_exp, batch_logits_exp + batch_size * n_vocab);
         }
 
         const auto t_end = std::chrono::high_resolution_clock::now();
@@ -496,6 +537,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (params.model_draft.empty()) {
+        fprintf(stderr, "%s: error: --model-draft is required\n", __func__);
+        return 1;
+    }
+
     params.logits_all = true;
     params.n_batch = std::min(params.n_batch, params.n_ctx);
 
@@ -514,20 +560,32 @@ int main(int argc, char ** argv) {
 
     llama_backend_init(params.numa);
 
-    llama_model * model;
-    llama_context * ctx;
+    llama_model * model_exp;
+    llama_model * model_ama;
+    llama_context * ctx_exp;
+    llama_context * ctx_ama;
 
     // load the model and apply lora adapter, if any
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
-    if (model == NULL) {
+    std::tie(model_exp, ctx_exp) = llama_init_from_gpt_params(params);
+
+    params.model = params.model_draft;
+    params.n_gpu_layers = params.n_gpu_layers_draft;
+    std::tie(model_ama, ctx_ama) = llama_init_from_gpt_params(params);
+
+    if (model_exp == NULL || model_ama == NULL) {
         fprintf(stderr, "%s: error: unable to load model\n", __func__);
         return 1;
     }
 
-    const int n_ctx_train = llama_n_ctx_train(model);
-    if (params.n_ctx > n_ctx_train) {
-        fprintf(stderr, "%s: warning: model was trained on only %d context tokens (%d specified)\n",
-                __func__, n_ctx_train, params.n_ctx);
+    const int n_ctx_train_exp = llama_n_ctx_train(model_exp);
+    const int n_ctx_train_ama = llama_n_ctx_train(model_ama);
+    if (params.n_ctx > n_ctx_train_exp) {
+        fprintf(stderr, "%s: warning: expert model was trained on only %d context tokens (%d specified)\n",
+                __func__, n_ctx_train_exp, params.n_ctx);
+    }
+    if (params.n_ctx > n_ctx_train_ama) {
+        fprintf(stderr, "%s: warning: amateur model was trained on only %d context tokens (%d specified)\n",
+                __func__, n_ctx_train_ama, params.n_ctx);
     }
 
     // print system information
@@ -536,17 +594,62 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s\n", get_system_info(params).c_str());
     }
 
+    {
+        const int n_vocab_exp = llama_n_vocab(model_exp);
+        const int n_vocab_ama = llama_n_vocab(model_ama);
+        const int vocab_diff  = n_vocab_exp > n_vocab_ama
+            ? n_vocab_exp - n_vocab_ama
+            : n_vocab_ama - n_vocab_exp;
+
+        if (vocab_diff > CONT_VOCAB_MAX_SIZE_DIFFERENCE) {
+            fprintf(stderr, "%s: error: amateur model vocab must closely match expert model to use contrastive decoding but ", __func__);
+            fprintf(stderr, "expert vocab size %d does not match amateur vocab size %d - difference %d, max allowed %d\n",
+                    n_vocab_exp, llama_n_vocab(model_ama), vocab_diff, CONT_VOCAB_MAX_SIZE_DIFFERENCE);
+            return 1;
+        }
+
+        for (int i = CONT_VOCAB_CHECK_START_TOKEN_ID; i < std::min(n_vocab_exp, n_vocab_ama); ++i) {
+            const char * token_text_exp = llama_token_get_text(model_exp, i);
+            const char * token_text_ama = llama_token_get_text(model_ama, i);
+            if (std::strcmp(token_text_exp, token_text_ama) != 0) {
+                fprintf(stderr, "%s: error: amateur model vocab must match expert model to use speculation but ", __func__);
+                fprintf(stderr, "token %d content differs - expert '%s', amateur '%s'\n", i,
+                        llama_token_to_piece(ctx_exp, i).c_str(),
+                        llama_token_to_piece(ctx_ama, i).c_str());
+                return 1;
+            }
+        }
+    }
+
+    const bool add_bos_exp = llama_should_add_bos_token(model_exp);
+    fprintf(stderr, "add_bos expert: %d\n", add_bos_exp);
+
+    const bool add_bos_ama = llama_should_add_bos_token(model_ama);
+    fprintf(stderr, "add_bos amateur: %d\n", add_bos_ama);
+
+    if (add_bos_exp != add_bos_ama) {
+        fprintf(stderr, "%s: error: amateur model add_bos must match expert model to use contrastive decoding but ", __func__);
+        fprintf(stderr, "add_bos_amateur = %d while add_bos_exp = %d\n", add_bos_ama, add_bos_exp);
+        return 1;
+    }
+
     struct results_perplexity results;
     if (params.hellaswag) {
         hellaswag_score(ctx, params);
     } else {
-        results = perplexity(ctx, params);
+        results = perplexity(ctx_exp, ctx_ama, params);
     }
 
-    llama_print_timings(ctx);
+    fprintf(stderr, "\namateur:\n");
+    llama_print_timings(ctx_ama);
 
-    llama_free(ctx);
-    llama_free_model(model);
+    fprintf(stderr, "\nexpert:\n");
+    llama_print_timings(ctx_exp);
+
+    llama_free(ctx_exp);
+    llama_free(ctx_ama);
+    llama_free_model(model_exp);
+    llama_free_model(model_ama);
 
     llama_backend_free();
 
