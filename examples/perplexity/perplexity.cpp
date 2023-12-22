@@ -27,55 +27,6 @@ struct results_log_softmax {
     float  prob;
 };
 
-static void write_logfile(
-    const llama_context * ctx, const gpt_params & params, const llama_model * model,
-    const struct results_perplexity & results
-) {
-    if (params.logdir.empty()) {
-        return;
-    }
-
-    if (params.hellaswag) {
-        fprintf(stderr, "%s: warning: logging results is not implemented for HellaSwag. No files will be written.\n", __func__);
-        return;
-    }
-
-    const std::string timestamp = get_sortable_timestamp();
-
-    const bool success = create_directory_with_parents(params.logdir);
-    if (!success) {
-        fprintf(stderr, "%s: warning: failed to create logdir %s, cannot write logfile\n",
-                __func__, params.logdir.c_str());
-        return;
-    }
-
-    const std::string logfile_path = params.logdir + timestamp + ".yml";
-    FILE * logfile = fopen(logfile_path.c_str(), "w");
-
-    if (logfile == NULL) {
-        fprintf(stderr, "%s: failed to open logfile %s\n", __func__, logfile_path.c_str());
-        return;
-    }
-
-    fprintf(logfile, "binary: main\n");
-    char model_desc[128];
-    llama_model_desc(model, model_desc, sizeof(model_desc));
-    dump_non_result_info_yaml(logfile, params, ctx, timestamp, results.tokens, model_desc);
-
-    fprintf(logfile, "\n");
-    fprintf(logfile, "######################\n");
-    fprintf(logfile, "# Perplexity Results #\n");
-    fprintf(logfile, "######################\n");
-    fprintf(logfile, "\n");
-
-    dump_vector_float_yaml(logfile, "logits", results.logits);
-    fprintf(logfile, "ppl_value: %f\n", results.ppl_value);
-    dump_vector_float_yaml(logfile, "probs", results.probs);
-
-    llama_dump_timing_info_yaml(logfile, ctx);
-    fclose(logfile);
-}
-
 static std::vector<float> softmax(const std::vector<float>& logits) {
     std::vector<float> probs(logits.size());
     float max_logit = logits[0];
@@ -143,145 +94,7 @@ static void process_logits(
     }
 }
 
-static results_perplexity perplexity_v2(llama_context * ctx, const gpt_params & params) {
-    // Download: https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip?ref=salesforce-research
-    // Run `./perplexity -m models/7B/ggml-model-q4_0.bin -f wiki.test.raw`
-    // Output: `perplexity: 13.5106 [114/114]`
-    // BOS tokens will be added for each chunk before eval
-
-    const bool add_bos = llama_should_add_bos_token(llama_get_model(ctx));
-
-    fprintf(stderr, "%s: tokenizing the input ..\n", __func__);
-
-    std::vector<llama_token> tokens = ::llama_tokenize(ctx, params.prompt, add_bos);
-
-    const int n_ctx = llama_n_ctx(ctx);
-
-    if (int(tokens.size()) < 2*n_ctx) {
-        fprintf(stderr, "%s: you need at least %d tokens to evaluate perplexity with a context of %d\n",__func__,2*n_ctx,
-                n_ctx);
-        fprintf(stderr, "%s: the data file you provided tokenizes to only %zu tokens\n",__func__,tokens.size());
-        return {std::move(tokens), 0., {}, {}};
-    }
-
-    std::vector<float> logit_history;
-    std::vector<float> prob_history;
-
-    logit_history.resize(tokens.size());
-    prob_history.resize(tokens.size());
-
-    if (params.ppl_stride <= 0) {
-        fprintf(stderr, "%s: stride is %d but must be greater than zero!\n",__func__,params.ppl_stride);
-        return {tokens, -1, logit_history, prob_history};
-    }
-
-    const int calc_chunk = n_ctx;
-
-    fprintf(stderr, "%s: have %zu tokens. Calculation chunk = %d\n", __func__, tokens.size(), calc_chunk);
-
-    if (int(tokens.size()) <= calc_chunk) {
-        fprintf(stderr, "%s: there are only %zu tokens, this is not enough for a context size of %d and stride %d\n",__func__,
-                tokens.size(), n_ctx, params.ppl_stride);
-        return {tokens, -1, logit_history, prob_history};
-    }
-
-    const int n_chunk_max = (tokens.size() - calc_chunk + params.ppl_stride - 1)  / params.ppl_stride;
-
-    const int n_chunk = params.n_chunks < 0 ? n_chunk_max : std::min(params.n_chunks, n_chunk_max);
-    const int n_vocab = llama_n_vocab(llama_get_model(ctx));
-    const int n_batch = params.n_batch;
-
-    int count = 0;
-    double nll = 0.0;
-
-    fprintf(stderr, "%s: calculating perplexity over %d chunks, batch_size=%d\n", __func__, n_chunk, n_batch);
-
-    for (int i = 0; i < n_chunk; ++i) {
-        const int start =     i * params.ppl_stride;
-        const int end   = start + calc_chunk;
-
-        const int num_batches = (calc_chunk + n_batch - 1) / n_batch;
-        //fprintf(stderr, "%s: evaluating %d...%d using %d batches\n", __func__, start, end, num_batches);
-
-        std::vector<float> logits;
-
-        const auto t_start = std::chrono::high_resolution_clock::now();
-
-        // clear the KV cache
-        llama_kv_cache_clear(ctx);
-
-        for (int j = 0; j < num_batches; ++j) {
-            const int batch_start = start + j * n_batch;
-            const int batch_size  = std::min(end - batch_start, n_batch);
-
-            //fprintf(stderr, "    Batch %d: starts at %d, size is %d, n_past is %d\n",j,batch_start,batch_size,j * n_batch);
-            if (llama_decode(ctx, llama_batch_get_one(tokens.data() + batch_start, batch_size, j * n_batch, 0))) {
-                //fprintf(stderr, "%s : failed to eval\n", __func__);
-                return {tokens, -1, logit_history, prob_history};
-            }
-
-            // save original token and restore it after eval
-            const auto token_org = tokens[batch_start];
-
-            // add BOS token for the first batch of each chunk
-            if (add_bos && j == 0) {
-                tokens[batch_start] = llama_token_bos(llama_get_model(ctx));
-            }
-
-            const auto batch_logits = llama_get_logits(ctx);
-            logits.insert(logits.end(), batch_logits, batch_logits + batch_size * n_vocab);
-
-            if (j == 0) {
-                tokens[batch_start] = token_org;
-            }
-        }
-
-        const auto t_end = std::chrono::high_resolution_clock::now();
-
-        if (i == 0) {
-            const float t_total = std::chrono::duration<float>(t_end - t_start).count();
-            fprintf(stderr, "%s: %.2f seconds per pass - ETA ", __func__, t_total);
-            int total_seconds = (int)(t_total * n_chunk);
-            if (total_seconds >= 60*60) {
-                fprintf(stderr, "%d hours ", total_seconds / (60*60));
-                total_seconds = total_seconds % (60*60);
-            }
-            fprintf(stderr, "%.2f minutes\n", total_seconds / 60.0);
-        }
-
-        //fprintf(stderr, "%s: using tokens %d...%d\n",__func__,params.n_ctx - params.ppl_stride + start, params.n_ctx + start);
-        for (int j = n_ctx - params.ppl_stride - 1; j < n_ctx - 1; ++j) {
-
-            // Calculate probability of next token, given the previous ones.
-            const std::vector<float> tok_logits(
-                logits.begin() + (j + 0) * n_vocab,
-                logits.begin() + (j + 1) * n_vocab);
-
-            const float prob = softmax(tok_logits)[tokens[start + j + 1]];
-            logit_history[start + j + 1] = tok_logits[tokens[start + j + 1]];
-            prob_history[start + j + 1]  = prob;
-
-            nll += -std::log(prob);
-            ++count;
-        }
-        // perplexity is e^(average negative log-likelihood)
-        if (params.ppl_output_type == 0) {
-            printf("[%d]%.4lf,", i + 1, std::exp(nll / count));
-        } else {
-            printf("%8d  %.4lf\n", i*params.ppl_stride, std::exp(nll / count));
-        }
-        fflush(stdout);
-    }
-    printf("\n");
-
-    return {tokens, std::exp(nll / count), logit_history, prob_history};
-}
-
 static results_perplexity perplexity(llama_context * ctx, const gpt_params & params) {
-    if (params.ppl_stride > 0) {
-        return perplexity_v2(ctx, params);
-    }
-
     // Download: https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip?ref=salesforce-research
     // Run `./perplexity -m models/7B/ggml-model-q4_0.bin -f wiki.test.raw`
     // Output: `perplexity: 13.5106 [114/114]`
@@ -686,12 +499,6 @@ int main(int argc, char ** argv) {
     params.logits_all = true;
     params.n_batch = std::min(params.n_batch, params.n_ctx);
 
-    if (params.ppl_stride > 0) {
-        fprintf(stderr, "Will perform strided perplexity calculation -> adjusting context size from %d to %d\n",
-                params.n_ctx, params.n_ctx + params.ppl_stride/2);
-        params.n_ctx += params.ppl_stride/2;
-    }
-
     print_build_info();
 
     if (params.seed == LLAMA_DEFAULT_SEED) {
@@ -737,7 +544,6 @@ int main(int argc, char ** argv) {
     }
 
     llama_print_timings(ctx);
-    write_logfile(ctx, params, model, results);
 
     llama_free(ctx);
     llama_free_model(model);
