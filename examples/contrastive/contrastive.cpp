@@ -363,10 +363,12 @@ int main(int argc, char ** argv) {
     size_t decode_count = 0;
     int64_t decode_time_total = 0, decode_time_last = 0;
 
-    const int n_vocab = std::min(llama_n_vocab(model_exp), llama_n_vocab(model_ama));
+    const int n_vocab_exp = llama_n_vocab(model_exp);
+    const int n_vocab = std::min(n_vocab_exp, llama_n_vocab(model_ama));
 
-    float cd_alpha = 0.1; // TODO: make CLI argument
-    float cd_beta = 0.5; // set to 0.5 to behave like original paper
+    const float cd_alpha = 0.1; // TODO: make CLI argument
+    const float cd_beta = 0.5; // set to 0.5 to behave like original paper
+    const float mask = std::numeric_limits<float>::lowest();
 
     while (!interrupted) {
         int idx = batch.n_tokens - 1;
@@ -375,15 +377,20 @@ int main(int argc, char ** argv) {
 
         float max_logit_exp = *std::max_element(logits_exp, logits_exp + n_vocab);
 
-        for (int i = 0; i < n_vocab; ++i) {
+        for (int i = 0; i < n_vocab_exp; ++i) {
             // NB: original paper applies alpha to probabilities, further paper defines in terms of log probs
             //     both have the same meaning
             if (logits_exp[i] < max_logit_exp + log(cd_alpha)) {
-                continue; // not a plausible token according to expert
-            }
+                // not a plausible token according to expert
+                logits_exp[i] = mask;
+            } else if (i >= n_vocab) {
+                // token not known to amateur
+                logits_exp[i] = mask;
+            } else {
 #if 1
-            logits_exp[i] = (1 + cd_beta) * logits_exp[i] - cd_beta * logits_ama[i];
+                logits_exp[i] = (1 + cd_beta) * logits_exp[i] - cd_beta * logits_ama[i];
 #endif
+            }
         }
 
         const llama_token id = llama_sampling_sample(ctx_sampling, ctx_exp, NULL, idx);
