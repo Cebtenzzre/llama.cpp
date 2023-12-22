@@ -375,6 +375,7 @@ int main(int argc, char ** argv) {
         float * logits_exp = llama_get_logits_ith(ctx_exp, idx);
         float * logits_ama = llama_get_logits_ith(ctx_ama, idx);
 
+#if 1
         float max_logit_exp = *std::max_element(logits_exp, logits_exp + n_vocab);
 
         for (int i = 0; i < n_vocab_exp; ++i) {
@@ -387,11 +388,10 @@ int main(int argc, char ** argv) {
                 // token not known to amateur
                 logits_exp[i] = mask;
             } else {
-#if 1
                 logits_exp[i] = (1 + cd_beta) * logits_exp[i] - cd_beta * logits_ama[i];
-#endif
             }
         }
+#endif
 
         const llama_token id = llama_sampling_sample(ctx_sampling, ctx_exp, NULL, idx);
         llama_sampling_accept(ctx_sampling, ctx_exp, id, true);
