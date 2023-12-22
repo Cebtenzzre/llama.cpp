@@ -154,6 +154,17 @@ static bool initialize(
         return false;
     }
 
+    const int n_ctx_train_exp = llama_n_ctx_train(model_exp);
+    const int n_ctx_train_ama = llama_n_ctx_train(model_ama);
+    if (params.n_ctx > n_ctx_train_exp) {
+        LOG_TEE("%s: warning: expert model was trained on only %d context tokens (%d specified)\n",
+                __func__, n_ctx_train_exp, params.n_ctx);
+    }
+    if (params.n_ctx > n_ctx_train_ama) {
+        LOG_TEE("%s: warning: amateur model was trained on only %d context tokens (%d specified)\n",
+                __func__, n_ctx_train_ama, params.n_ctx);
+    }
+
     // print system information
     {
         LOG_TEE("\n");
