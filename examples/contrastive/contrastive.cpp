@@ -246,8 +246,8 @@ static bool initialize(
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
 
-    // llama_sampling_params & sparams = params.sparams;
-    // LOG_TEE("sampling: %s\n", llama_sampling_print(sparams).c_str());
+    llama_sampling_params & sparams = params.sparams;
+    LOG_TEE("sampling: %s\n", llama_sampling_print(sparams).c_str());
     LOG_TEE("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);
     LOG_TEE("\n\n");
 
@@ -337,7 +337,7 @@ int main(int argc, char ** argv) {
 
     const size_t prompt_size = prompt_tokens.size();
     llama_batch batch = llama_batch_init(std::max(int32_t(prompt_size), params.n_batch), 0, 1);
-    // llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
+    llama_sampling_context * ctx_sampling = llama_sampling_init(params.sparams);
 
     if (!feed_prompt(ctx_exp, ctx_ama, params, batch, prompt_tokens)) {
         return 1;
@@ -355,33 +355,28 @@ int main(int argc, char ** argv) {
     const int n_vocab = std::min(llama_n_vocab(model_exp), llama_n_vocab(model_ama));
 
     float cd_alpha = 0.1; // TODO: make CLI argument
+    float cd_beta = 0.5; // set to 0.5 to behave like original paper
 
     while (!interrupted) {
         int idx = batch.n_tokens - 1;
         float * logits_exp = llama_get_logits_ith(ctx_exp, idx);
         float * logits_ama = llama_get_logits_ith(ctx_ama, idx);
 
-        float max_logit_exp = std::numeric_limits<float>::lowest();
-        for (int i = 0; i < n_vocab; ++i) {
-            max_logit_exp = std::max(max_logit_exp, logits_exp[i]);
-        }
+        float max_logit_exp = *std::max_element(logits_exp, logits_exp + n_vocab);
 
-        // TODO: use beam search
-        llama_token id = -1;
-        float max_cd = std::numeric_limits<float>::lowest();
         for (int i = 0; i < n_vocab; ++i) {
-            if (logits_exp[i] < cd_alpha * max_logit_exp) {
+            // NB: original paper applies alpha to probabilities, further paper defines in terms of log probs
+            //     both have the same meaning
+            if (logits_exp[i] < max_logit_exp + log(cd_alpha)) {
                 continue; // not a plausible token according to expert
             }
-            float l_cd = logits_exp[i] - logits_ama[i];
-            if (l_cd >= max_cd) {
-                id = i;
-                max_cd = l_cd;
-            }
+#if 1
+            logits_exp[i] = (1 + cd_beta) * logits_exp[i] - cd_beta * logits_ama[i];
+#endif
         }
 
-        // const llama_token id = llama_sampling_sample(ctx_sampling, ctx_exp, NULL, idx);
-        // llama_sampling_accept(ctx_sampling, ctx_exp, id, true);
+        const llama_token id = llama_sampling_sample(ctx_sampling, ctx_exp, NULL, idx);
+        llama_sampling_accept(ctx_sampling, ctx_exp, id, true);
 
         n_past++;
         n_remain--;
@@ -427,7 +422,7 @@ int main(int argc, char ** argv) {
     LOG_TEE("\nexpert:\n");
     llama_print_timings(ctx_exp);
 
-    // llama_sampling_free(ctx_sampling);
+    llama_sampling_free(ctx_sampling);
 
     llama_batch_free(batch);
 
